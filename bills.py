@@ -1,5 +1,5 @@
 r"""
-Bill Dashboard — a desktop bill / subscription / expense tracker.
+CentsRich — a desktop bill / subscription / expense tracker.
 
 Stack: Python standard library (tkinter + sqlite3). The optional system tray adds
 two small packages (pystray, pillow); without them the app still runs one-shot.
@@ -20,7 +20,7 @@ Tray mode needs:  pip install pystray pillow   (otherwise it falls back to --onc
 Notifications:    once-a-day toast at morning_time summarizing overdue / due items.
                   Toggle via the tray menu; each bill has its own "remind days before"
                   lead time (set in the Manager). (Tray mode only.)
-Data lives in:    %USERPROFILE%\.bill-dashboard\bills.db
+Data lives in:    %USERPROFILE%\.centsrich\bills.db
 """
 
 import os
@@ -71,17 +71,17 @@ if sys.platform == "win32":
 # --------------------------------------------------------------------------- #
 #  Paths / constants
 # --------------------------------------------------------------------------- #
-APP_DIR = Path.home() / ".bill-dashboard"
+APP_DIR = Path.home() / ".centsrich"
 DB_PATH = APP_DIR / "bills.db"
 ICON_PATH = Path(__file__).resolve().with_name("billicon.ico")  # app icon, beside this file
-APP_ID = "Royte.BillDashboard"  # taskbar identity (groups windows + pinned shortcut)
+APP_ID = "Royte.CentsRich"  # taskbar identity (groups windows + pinned shortcut)
 SHOW_REQUEST = APP_DIR / "show.request"  # a 2nd launch drops this so the running instance pops the dashboard
 HORIZON_DAYS_DEFAULT = 90
 GRACE_DAYS = 7  # how far back overdue items are still materialized/shown
 
-KINDS = ["bill", "subscription", "expense"]
-FREQUENCIES = ["one-time", "weekly", "monthly", "yearly", "custom"]
-CUSTOM_UNITS = ["days", "weeks", "months", "years"]
+# Bill type (kind) and frequency are now inferred automatically — the user never
+# picks them.  See infer_type() below.  The advance() engine still supports all
+# legacy frequency values for backward-compatible recurrence of older records.
 # Category taxonomy: top-level -> subcategories. This is the single source of
 # truth for the two-level picker. Add/remove categories or subcategories here and
 # the picker updates automatically — order is preserved exactly as written.
@@ -149,6 +149,33 @@ def format_category(top, sub):
     """Combine a top-level category and a subcategory into the stored value."""
     return f"{top}{CATEGORY_SEP}{sub}"
 
+
+def infer_type(data: dict) -> dict:
+    """Auto-compute *kind* and *frequency* from the form inputs.
+
+    Rules (the user never touches these fields):
+      • anchor_date present + SUBSCRIPTIONS category → subscription, monthly
+      • anchor_date present (any other category)     → bill, monthly
+      • anchor_date absent                           → expense, one-time
+        (anchor_date is back-filled with today so the DB NOT-NULL stays happy)
+    """
+    has_due = bool(data.get("anchor_date"))
+    cat_top = (data.get("category") or "").split(CATEGORY_SEP)[0].strip().upper()
+
+    if not has_due:
+        data.update(kind="expense", frequency="one-time",
+                    anchor_date=date.today().isoformat(),
+                    end_date=None, autopay=0, notify=0, notify_days_before=0,
+                    custom_interval=None, custom_unit=None)
+    elif cat_top == "SUBSCRIPTIONS":
+        data.update(kind="subscription", frequency="monthly",
+                    custom_interval=None, custom_unit=None)
+    else:
+        data.update(kind="bill", frequency="monthly",
+                    custom_interval=None, custom_unit=None)
+    return data
+
+
 # Dark theme palette
 BG = "#1e1f24"
 BG_BAR = "#26272e"
@@ -188,7 +215,7 @@ def acquire_single_instance() -> bool:
         return True
     ERROR_ALREADY_EXISTS = 183
     _singleton_handle = ctypes.windll.kernel32.CreateMutexW(
-        None, False, "Local\\BillDashboard_singleton")
+        None, False, "Local\\CentsRich_singleton")
     return ctypes.windll.kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
@@ -245,7 +272,7 @@ def python_launcher() -> Path:
 
 
 def _write_shortcut(folder_expr: str, tip: str = "") -> None:
-    """Create a 'Bill Dashboard.lnk' that launches the tray app (pythonw + custom
+    """Create a 'CentsRich.lnk' that launches the tray app (pythonw + custom
     icon) inside the folder named by a PowerShell GetFolderPath() expression.
     Uses the built-in Windows COM scripting host, so it needs no extra packages."""
     if sys.platform != "win32":
@@ -259,13 +286,13 @@ def _write_shortcut(folder_expr: str, tip: str = "") -> None:
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
         f"$dir = {folder_expr}; "
-        "$lnk = Join-Path $dir 'Bill Dashboard.lnk'; "
+        "$lnk = Join-Path $dir 'CentsRich.lnk'; "
         "$s = $ws.CreateShortcut($lnk); "
         f"$s.TargetPath = '{launcher}'; "
         f"$s.Arguments = '\"{script}\"'; "
         f"$s.WorkingDirectory = '{workdir}'; "
         f"$s.IconLocation = '{icon}'; "
-        "$s.Description = 'Bill Dashboard'; "
+        "$s.Description = 'CentsRich'; "
         "$s.Save(); "
         "Write-Output $lnk"
     )
@@ -287,14 +314,14 @@ def create_desktop_shortcut() -> None:
     _write_shortcut(
         "[Environment]::GetFolderPath('Desktop')",
         tip="Tip: right-click it -> 'Pin to taskbar' (or 'Show more options' "
-            "on Windows 11) to pin Bill Dashboard.")
+            "on Windows 11) to pin CentsRich.")
 
 
 def create_startup_shortcut() -> None:
     """Startup-folder shortcut so the tray app auto-launches at login."""
     _write_shortcut(
         "[Environment]::GetFolderPath('Startup')",
-        tip="Bill Dashboard will now start automatically at login. "
+        tip="CentsRich will now start automatically at login. "
             "Remove it any time from the folder opened by:  shell:startup")
 
 
@@ -489,7 +516,7 @@ def get_dashboard(conn):
     rows = conn.execute(
         """
         SELECT o.id, o.bill_id, o.due_date, o.amount, o.paid,
-               b.name, b.kind, b.category, b.currency
+               b.name, b.category, b.currency
           FROM occurrences o JOIN bills b ON b.id = o.bill_id
          WHERE o.paid = 0
          ORDER BY o.due_date ASC, b.name ASC
@@ -554,7 +581,7 @@ def build_notice(rows):
         headline.append(f"{len(due_today)} due today")
     if soon:
         headline.append(f"{len(soon)} due soon")
-    title = "Bills: " + (", ".join(headline) if headline else "nothing due")
+    title = "CentsRich: " + (", ".join(headline) if headline else "nothing due")
 
     total = sum(r["amount"] for r in rows)
     names = ", ".join(r["name"] for r in rows[:4])
@@ -565,6 +592,7 @@ def build_notice(rows):
 
 
 def save_bill(conn, data: dict):
+    data = infer_type(data)  # auto-fill kind, frequency, custom_* from the inputs
     fields = (
         "name", "kind", "amount", "category", "frequency", "custom_interval",
         "custom_unit", "anchor_date", "end_date", "autopay", "notify",
@@ -634,7 +662,7 @@ class Dashboard:
         self.on_close = on_close
         self.win = tk.Toplevel(parent)
         win = self.win
-        win.title("Bill Dashboard")
+        win.title("CentsRich Command Center")
         set_window_icon(win)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
@@ -670,7 +698,7 @@ class Dashboard:
         bar.pack(fill="x")
         bar.pack_propagate(False)
 
-        title = tk.Label(bar, text="  Today’s Bills", bg=BG_BAR, fg=FG,
+        title = tk.Label(bar, text="  CentsRich", bg=BG_BAR, fg=FG,
                          font=("Segoe UI", round(11 * 1.2), "bold"))
         title.pack(side="left", padx=6)
 
@@ -695,8 +723,8 @@ class Dashboard:
         self._hover(self.min_btn, FG)
 
         manage = tk.Label(bar, text="Manage", bg=BG_BAR, fg="white",
-                          font=("Segoe UI", 9), cursor="hand2")
-        manage.pack(side="right", padx=6)
+                          font=("Segoe UI", 8), cursor="hand2")
+        manage.pack(side="right", padx=4)
         manage.bind("<Button-1>", lambda e: open_manager(self.win, self.conn, self.refresh))
 
         # drag the frameless window by its title bar
@@ -1180,9 +1208,16 @@ class InlineCategoryDropdown:
 # --------------------------------------------------------------------------- #
 def open_manager(parent, conn, on_change=None):
     win = tk.Toplevel(parent)
-    win.title("Bill Dashboard — Manager")
+    win.title("CentsRich — Command Center")
     win.configure(bg=BG)
     set_window_icon(win)
+
+    # Prominent header so the brand is readable even when the OS title bar is small
+    hdr = tk.Frame(win, bg=BG_BAR)
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="CentsRich Command Center", bg=BG_BAR, fg=FG,
+             font=("Segoe UI", 16, "bold")).pack(
+                 padx=14, pady=8)
 
     style = ttk.Style(win)
     try:
@@ -1193,12 +1228,11 @@ def open_manager(parent, conn, on_change=None):
                     foreground=FG, rowheight=round(24 * FONT_SCALE))
     style.configure("Treeview.Heading", background=BG_BAR, foreground=FG)
 
-    cols = ("name", "kind", "amount", "frequency", "next", "remind", "active")
+    cols = ("name", "type", "amount", "next", "remind", "active")
     tree = ttk.Treeview(win, columns=cols, show="headings", height=10)
     for c, txt, w in [
-        ("name", "Name", 150), ("kind", "Kind", 85), ("amount", "Amount", 85),
-        ("frequency", "Frequency", 85), ("next", "Next Due", 95),
-        ("remind", "Remind", 95), ("active", "Active", 55),
+        ("name", "Name", 160), ("type", "Type", 95), ("amount", "Amount", 90),
+        ("next", "Next Due", 100), ("remind", "Remind", 95), ("active", "Active", 55),
     ]:
         tree.heading(c, text=txt)
         tree.column(c, width=round(w * FONT_SCALE), anchor="w")
@@ -1210,12 +1244,8 @@ def open_manager(parent, conn, on_change=None):
     vars_ = {
         "id": tk.StringVar(),
         "name": tk.StringVar(),
-        "kind": tk.StringVar(value="bill"),
         "amount": tk.StringVar(value="0"),
         "category": tk.StringVar(),
-        "frequency": tk.StringVar(value="monthly"),
-        "custom_interval": tk.StringVar(value="1"),
-        "custom_unit": tk.StringVar(value="months"),
         "anchor_date": tk.StringVar(value=date.today().isoformat()),
         "end_date": tk.StringVar(),
         "autopay": tk.IntVar(),
@@ -1226,46 +1256,88 @@ def open_manager(parent, conn, on_change=None):
     }
 
     def field(parent, label, r, c, widget):
-        tk.Label(parent, text=label, bg=BG, fg=FG_MUTED,
-                 font=("Segoe UI", 9)).grid(row=r, column=c * 2, sticky="e", padx=4, pady=3)
+        lbl = tk.Label(parent, text=label, bg=BG, fg=FG_MUTED,
+                       font=("Segoe UI", 9))
+        lbl.grid(row=r, column=c * 2, sticky="e", padx=4, pady=3)
         widget.grid(row=r, column=c * 2 + 1, sticky="w", padx=4, pady=3)
+        return lbl  # return the label so callers can modify it later
 
+    # Row 0 — always visible: Name | Amount | auto-inferred type indicator
     field(form, "Name", 0, 0, tk.Entry(form, textvariable=vars_["name"], width=22))
-    field(form, "Kind", 0, 1, ttk.Combobox(form, textvariable=vars_["kind"],
-                                            values=KINDS, width=12, state="readonly"))
-    field(form, "Amount", 0, 2, tk.Entry(form, textvariable=vars_["amount"], width=10))
+    field(form, "Amount", 0, 1, tk.Entry(form, textvariable=vars_["amount"], width=10))
+    type_lbl = tk.Label(form, text="", bg=BG, fg=BLUE,
+                        font=("Segoe UI", 9, "bold"))
+    type_lbl.grid(row=0, column=4, columnspan=2, sticky="w", padx=8)
+
+    # Row 1 — always visible: Category | Due Date (clearable → expense mode)
     category_entry = tk.Entry(form, textvariable=vars_["category"], width=22,
                               state="readonly", readonlybackground="white", cursor="hand2")
     field(form, "Category", 1, 0, category_entry)
     InlineCategoryDropdown(win, category_entry, vars_["category"])
-    field(form, "Frequency", 1, 1, ttk.Combobox(form, textvariable=vars_["frequency"],
-                                                 values=FREQUENCIES, width=12, state="readonly"))
     anchor_entry = tk.Entry(form, textvariable=vars_["anchor_date"], width=12,
                             state="readonly", readonlybackground="white", cursor="hand2")
-    field(form, "Anchor (YYYY-MM-DD)", 1, 2, anchor_entry)
+    date_lbl = field(form, "Due Date", 1, 1, anchor_entry)
     anchor_entry.bind("<Button-1>",
-                      lambda e: DatePicker(anchor_entry, vars_["anchor_date"]))
-    field(form, "Custom every", 2, 0, tk.Entry(form, textvariable=vars_["custom_interval"], width=6))
-    field(form, "Custom unit", 2, 1, ttk.Combobox(form, textvariable=vars_["custom_unit"],
-                                                   values=CUSTOM_UNITS, width=12, state="readonly"))
+                      lambda e: DatePicker(anchor_entry, vars_["anchor_date"],
+                                           allow_clear=True))
+
+    # Row 2 — bill-only: End Date | Remind days before
     end_entry = tk.Entry(form, textvariable=vars_["end_date"], width=12,
                          state="readonly", readonlybackground="white", cursor="hand2")
-    field(form, "End (optional)", 2, 2, end_entry)
+    end_lbl = field(form, "End (optional)", 2, 0, end_entry)
     end_entry.bind("<Button-1>",
                    lambda e: DatePicker(end_entry, vars_["end_date"], allow_clear=True))
-    tk.Checkbutton(form, text="Autopay", variable=vars_["autopay"], bg=BG, fg=FG,
-                   selectcolor=BG_BAR, activebackground=BG).grid(row=3, column=1, sticky="w")
-    tk.Checkbutton(form, text="Active", variable=vars_["active"], bg=BG, fg=FG,
-                   selectcolor=BG_BAR, activebackground=BG).grid(row=3, column=3, sticky="w")
-    tk.Checkbutton(form, text="Notify", variable=vars_["notify"], bg=BG, fg=FG,
-                   selectcolor=BG_BAR, activebackground=BG).grid(row=3, column=5, sticky="w")
-    field(form, "Notes", 4, 0, tk.Entry(form, textvariable=vars_["notes"], width=22))
-    field(form, "Remind days before", 4, 1,
-          tk.Entry(form, textvariable=vars_["notify_days_before"], width=6))
+    remind_entry = tk.Entry(form, textvariable=vars_["notify_days_before"], width=6)
+    remind_lbl = field(form, "Remind days before", 2, 1, remind_entry)
 
+    # Row 3 — checkboxes (Autopay/Notify are bill-only; Active is always visible)
+    autopay_cb = tk.Checkbutton(form, text="Autopay", variable=vars_["autopay"],
+                                bg=BG, fg=FG, selectcolor=BG_BAR, activebackground=BG)
+    autopay_cb.grid(row=3, column=1, sticky="w")
+    notify_cb = tk.Checkbutton(form, text="Notify", variable=vars_["notify"],
+                               bg=BG, fg=FG, selectcolor=BG_BAR, activebackground=BG)
+    notify_cb.grid(row=3, column=3, sticky="w")
+    tk.Checkbutton(form, text="Active", variable=vars_["active"], bg=BG, fg=FG,
+                   selectcolor=BG_BAR, activebackground=BG).grid(row=3, column=5, sticky="w")
+
+    # Row 4 — always visible: Notes
+    field(form, "Notes", 4, 0, tk.Entry(form, textvariable=vars_["notes"], width=22))
+
+    # --- dynamic mode: show/hide bill-only fields based on due-date presence ---
+    _bill_widgets = []
+    for w in (end_lbl, end_entry, remind_lbl, remind_entry, autopay_cb, notify_cb):
+        info = {k: v for k, v in w.grid_info().items() if k != "in"}
+        _bill_widgets.append((w, info))
+
+    def _update_mode(*_args):
+        has_due = bool(vars_["anchor_date"].get().strip())
+        cat = vars_["category"].get()
+        cat_top = (cat or "").split(CATEGORY_SEP)[0].strip().upper()
+        if not has_due:
+            type_lbl.config(text="Expense (one-time)", fg=AMBER)
+            date_lbl.config(text="Date")
+            for w, _ in _bill_widgets:
+                w.grid_remove()
+        elif cat_top == "SUBSCRIPTIONS":
+            type_lbl.config(text="Subscription (monthly)", fg=GREEN)
+            date_lbl.config(text="Due Date")
+            for w, info in _bill_widgets:
+                w.grid(**info)
+        else:
+            type_lbl.config(text="Bill (monthly)", fg=BLUE)
+            date_lbl.config(text="Due Date")
+            for w, info in _bill_widgets:
+                w.grid(**info)
+
+    vars_["anchor_date"].trace_add("write", _update_mode)
+    vars_["category"].trace_add("write", _update_mode)
+    _update_mode()  # set initial state
+
+    # --- table / form interaction ---
     def reload_tree():
         tree.delete(*tree.get_children())
         for b in conn.execute("SELECT * FROM bills ORDER BY name").fetchall():
+            btype = (b["kind"] or "bill").capitalize()
             if not b["notify"]:
                 remind = "off"
             elif (b["notify_days_before"] or 0) == 0:
@@ -1273,7 +1345,7 @@ def open_manager(parent, conn, on_change=None):
             else:
                 remind = f"{b['notify_days_before']}d before"
             tree.insert("", "end", iid=str(b["id"]), values=(
-                b["name"], b["kind"], f"${b['amount']:,.2f}", b["frequency"],
+                b["name"], btype, f"${b['amount']:,.2f}",
                 next_due(conn, b["id"]), remind, "yes" if b["active"] else "no",
             ))
         if on_change:
@@ -1285,10 +1357,6 @@ def open_manager(parent, conn, on_change=None):
                 v.set(1 if k in ("active", "notify") else 0)
             else:
                 v.set("")
-        vars_["kind"].set("bill")
-        vars_["frequency"].set("monthly")
-        vars_["custom_unit"].set("months")
-        vars_["custom_interval"].set("1")
         vars_["anchor_date"].set(date.today().isoformat())
         vars_["notify_days_before"].set(get_setting(conn, "notify_days_before", "1"))
 
@@ -1299,13 +1367,13 @@ def open_manager(parent, conn, on_change=None):
         b = conn.execute("SELECT * FROM bills WHERE id=?", (int(sel[0]),)).fetchone()
         vars_["id"].set(str(b["id"]))
         vars_["name"].set(b["name"])
-        vars_["kind"].set(b["kind"])
         vars_["amount"].set(str(b["amount"]))
         vars_["category"].set(b["category"] or "")
-        vars_["frequency"].set(b["frequency"])
-        vars_["custom_interval"].set(str(b["custom_interval"] or 1))
-        vars_["custom_unit"].set(b["custom_unit"] or "months")
-        vars_["anchor_date"].set(b["anchor_date"])
+        # Expenses (one-time) → clear due date so the form shows expense mode.
+        if b["frequency"] == "one-time" or b["kind"] == "expense":
+            vars_["anchor_date"].set("")
+        else:
+            vars_["anchor_date"].set(b["anchor_date"])
         vars_["end_date"].set(b["end_date"] or "")
         vars_["autopay"].set(b["autopay"])
         vars_["notify"].set(b["notify"] if b["notify"] is not None else 1)
@@ -1319,9 +1387,10 @@ def open_manager(parent, conn, on_change=None):
     def do_save():
         try:
             amount = float(vars_["amount"].get() or 0)
-            interval = int(vars_["custom_interval"].get() or 1)
             remind = max(0, int(vars_["notify_days_before"].get() or 1))
-            date.fromisoformat(vars_["anchor_date"].get())
+            anchor = vars_["anchor_date"].get().strip()
+            if anchor:
+                date.fromisoformat(anchor)
             if vars_["end_date"].get():
                 date.fromisoformat(vars_["end_date"].get())
         except ValueError:
@@ -1332,16 +1401,21 @@ def open_manager(parent, conn, on_change=None):
         if not vars_["name"].get().strip():
             messagebox.showerror("Invalid input", "Name is required.")
             return
+        # Subscriptions require a due date
+        cat = vars_["category"].get().strip() or None
+        cat_top = (cat or "").split(CATEGORY_SEP)[0].strip().upper()
+        if cat_top == "SUBSCRIPTIONS" and not anchor:
+            messagebox.showwarning(
+                "Due date required",
+                "Subscriptions are recurring and need a due date.\n"
+                "Please set a due date, or choose a different category.")
+            return
         data = {
             "id": int(vars_["id"].get()) if vars_["id"].get() else None,
             "name": vars_["name"].get().strip(),
-            "kind": vars_["kind"].get(),
             "amount": amount,
-            "category": vars_["category"].get().strip() or None,
-            "frequency": vars_["frequency"].get(),
-            "custom_interval": interval,
-            "custom_unit": vars_["custom_unit"].get(),
-            "anchor_date": vars_["anchor_date"].get(),
+            "category": cat,
+            "anchor_date": anchor or None,
             "end_date": vars_["end_date"].get().strip() or None,
             "autopay": vars_["autopay"].get(),
             "notify": vars_["notify"].get(),
@@ -1427,12 +1501,12 @@ class TrayApp:
         # reads/writes this in-memory flag and marshals DB writes to the tk thread.
         self.notify_enabled = get_setting(self.conn, "notifications", "1") == "1"
         self.icon = pystray.Icon(
-            "BillDashboard", tray_image(), "Bill Dashboard",
+            "CentsRich", tray_image(), "CentsRich",
             menu=pystray.Menu(
-                pystray.MenuItem("Show dashboard",
+                pystray.MenuItem("Show Command Center",
                                  lambda: self.root.after(0, self.show_dashboard),
                                  default=True),
-                pystray.MenuItem("Manage bills",
+                pystray.MenuItem("Command Center",
                                  lambda: self.root.after(0, self._open_manager)),
                 pystray.MenuItem(
                     "Notifications",
@@ -1589,7 +1663,7 @@ def main():
         if "--auto" in args and get_setting(conn, "last_dismissed_date") == date.today().isoformat():
             return
         if not HAS_TRAY and not args:
-            print("Tip: run 'pip install pystray pillow' to keep Bill Dashboard "
+            print("Tip: run 'pip install pystray pillow' to keep CentsRich "
                   "in your system tray instead of relaunching it.")
         root = tk.Tk()
         root.withdraw()
